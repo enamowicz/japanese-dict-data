@@ -8,8 +8,9 @@ a GitHub Release every month.
 | File | What |
 |---|---|
 | `dict.sqlite.gz` | The dictionary as a gzip-compressed SQLite database |
-| `manifest.json` | Version, schema, size and SHA-256 of the download and of the unpacked database, source versions |
-| `DATA-LICENSE.md` | Licence and attribution (CC BY-SA 4.0) |
+| `sudachi-core.dic.gz` | SudachiDict's core system dictionary for the app's tokenizer (Sudachi 0.8.2+, format V1) |
+| `manifest.json` | Version, schema, size and SHA-256 of each download, source versions (`tokenizer` describes the Sudachi file) |
+| `DATA-LICENSE.md`, `SudachiDict-LEGAL.txt` | Licences and attribution |
 
 The app reads `https://github.com/enamowicz/japanese-dict-data/releases/latest/download/manifest.json`.
 
@@ -36,5 +37,5 @@ The output goes to `dist/`. Source downloads are cached in `cache/`.
 
 ## Licences
 
-The build script is MIT (`LICENSE`). The built dictionary is CC BY-SA 4.0; see `DATA-LICENSE.md` for
-the sources and required attribution.
+The build script is MIT (`LICENSE`). The built dictionary is CC BY-SA 4.0 and the Sudachi dictionary is
+Apache-2.0; see `DATA-LICENSE.md` for the sources and required attribution.

@@ -26,7 +26,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           version=$(python -c "import json; print(json.load(open('dist/manifest.json'))['version'])")
-          gh release create "v$version" dist/dict.sqlite.gz dist/manifest.json DATA-LICENSE.md \
+          gh release create "v$version" dist/dict.sqlite.gz dist/sudachi-core.dic.gz dist/manifest.json \
+            DATA-LICENSE.md licenses/SudachiDict-LEGAL.txt \
             --title "Dictionary $version" \
-            --notes "Built from $(python -c "import json; s=json.load(open('dist/manifest.json'))['sources']; print('JMdict', s['jmdict_date'] + ', KANJIDIC2', s['kanjidic2_date'] + ', wordfreq', s['wordfreq'])"). Licence: CC BY-SA 4.0, see DATA-LICENSE.md." \
+            --notes "$(python release_notes.py dist/manifest.json)" \
             --latest

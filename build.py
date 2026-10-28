@@ -1,13 +1,15 @@
 """Builds dict.sqlite for the Japanese reading app from public dictionary data.
 
-Sources (see README.md for licences):
+Sources (see DATA-LICENSE.md for licences):
   JMdict (English) and KANJIDIC2 via jmdict-simplified, JLPT vocabulary lists from
-  open-anki-jlpt-decks, word frequencies from wordfreq.
+  open-anki-jlpt-decks, word frequencies from wordfreq. The release also carries the
+  SudachiDict system dictionary for the app's tokenizer, unchanged.
 
 Usage:
   python build.py [--out dist]
 
-Writes <out>/dict.sqlite, <out>/dict.sqlite.gz and <out>/manifest.json.
+Writes <out>/dict.sqlite, <out>/dict.sqlite.gz, <out>/sudachi-<edition>.dic.gz and
+<out>/manifest.json.
 """
 
 import argparse
@@ -34,6 +36,9 @@ import wordfreq
 SCHEMA = 1
 
 JMDICT_RELEASE = "https://api.github.com/repos/scriptin/jmdict-simplified/releases/latest"
+SUDACHI_RELEASE = "https://api.github.com/repos/WorksApplications/SudachiDict/releases/latest"
+# "core" keeps compound words whole (人間関係, 一生懸命); "small" only has short units.
+SUDACHI_EDITION = "core"
 JLPT_CSV = "https://raw.githubusercontent.com/jamsinclair/open-anki-jlpt-decks/main/src/n{level}.csv"
 CACHE = Path(__file__).parent / "cache"
 
@@ -259,6 +264,37 @@ def write_kanji(db: sqlite3.Connection, kanjidic: dict) -> None:
         )
 
 
+def sudachi_dictionary(out: Path) -> dict:
+    """Copies the latest SudachiDict system dictionary into the release as <out>/sudachi-<edition>.dic.gz
+    and returns its manifest entry. The .dic is used as published (binary format V1, which needs
+    Sudachi 0.8.2+ / SudachiPy 0.7+)."""
+    release = json.loads(urllib.request.urlopen(SUDACHI_RELEASE).read())
+    version = release["tag_name"].lstrip("v")
+    name = f"sudachi-dictionary-{version}-{SUDACHI_EDITION}.zip"
+    url = next(a["browser_download_url"] for a in release["assets"] if a["name"] == name)
+    dic_path = out / f"sudachi-{SUDACHI_EDITION}.dic"
+    with zipfile.ZipFile(io.BytesIO(fetch(url, name))) as archive:
+        member = next(n for n in archive.namelist() if n.endswith(f"system_{SUDACHI_EDITION}.dic"))
+        with archive.open(member) as src, dic_path.open("wb") as dst:
+            shutil.copyfileobj(src, dst, 1 << 20)
+    gz_path = gzip_file(dic_path)
+    return {
+        "version": version,
+        "edition": SUDACHI_EDITION,
+        "file": gz_path.name,
+        "size": gz_path.stat().st_size,
+        "sha256": sha256(gz_path),
+        "uncompressedSize": dic_path.stat().st_size,
+    }
+
+
+def gzip_file(path: Path) -> Path:
+    gz_path = path.with_name(path.name + ".gz")
+    with path.open("rb") as src, gzip.GzipFile(gz_path, "wb", compresslevel=9, mtime=0) as dst:
+        shutil.copyfileobj(src, dst, 1 << 20)
+    return gz_path
+
+
 def sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as f:
@@ -302,10 +338,11 @@ def main() -> None:
     db.commit()
     db.close()
 
-    gz_path = args.out / "dict.sqlite.gz"
-    with db_path.open("rb") as src, gzip.GzipFile(gz_path, "wb", compresslevel=9, mtime=0) as dst:
-        shutil.copyfileobj(src, dst, 1 << 20)
+    gz_path = gzip_file(db_path)
+    tokenizer = sudachi_dictionary(args.out)
 
+    # The top-level fields describe dict.sqlite (schema 1 apps read only those); "tokenizer" was added
+    # for the app's Sudachi tokenizer and is installed only when its version changes.
     manifest = {
         "schema": SCHEMA,
         "version": version,
@@ -315,6 +352,7 @@ def main() -> None:
         "uncompressedSize": db_path.stat().st_size,
         "uncompressedSha256": sha256(db_path),
         "sources": meta,
+        "tokenizer": tokenizer,
     }
     (args.out / "manifest.json").write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     (args.out / "jlpt-unmatched.txt").write_text("\n".join(jlpt["unmatched"]) + "\n", encoding="utf-8")
@@ -322,6 +360,7 @@ def main() -> None:
     print(f"entries {len(forms_by_id)}, kanji {len(kanjidic['characters'])}")
     print(f"JLPT rows {jlpt['rows']}, matched {jlpt['matched']}, entries with a level {jlpt['entries']}, unmatched {len(jlpt['unmatched'])}")
     print(f"dict.sqlite {db_path.stat().st_size / 1e6:.1f} MB, dict.sqlite.gz {gz_path.stat().st_size / 1e6:.1f} MB")
+    print(f"sudachi {tokenizer['version']} {tokenizer['edition']}: {tokenizer['uncompressedSize'] / 1e6:.1f} MB, gzip {tokenizer['size'] / 1e6:.1f} MB")
 
 
 if __name__ == "__main__":
