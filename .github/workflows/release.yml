@@ -1,0 +1,32 @@
+name: Build and release dictionary
+
+# Monthly rebuild from the latest JMdict/KANJIDIC2 data (EDRDG asks apps to update regularly).
+# Run it by hand from the Actions tab to publish a new version right away.
+on:
+  schedule:
+    - cron: "0 4 2 * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - run: python build.py --out dist
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version=$(python -c "import json; print(json.load(open('dist/manifest.json'))['version'])")
+          gh release create "v$version" dist/dict.sqlite.gz dist/manifest.json DATA-LICENSE.md \
+            --title "Dictionary $version" \
+            --notes "Built from $(python -c "import json; s=json.load(open('dist/manifest.json'))['sources']; print('JMdict', s['jmdict_date'] + ', KANJIDIC2', s['kanjidic2_date'] + ', wordfreq', s['wordfreq'])"). Licence: CC BY-SA 4.0, see DATA-LICENSE.md." \
+            --latest
