@@ -150,8 +150,8 @@ def zipf_of(frequencies: dict[str, float], forms: list[str]) -> int:
     return round(math.log10(best * 1e9) * 100) if best > 0 else 0
 
 
-def write_entries(db: sqlite3.Connection, jmdict: dict) -> dict[int, tuple[list[str], list[str], bool]]:
-    """Inserts JMdict entries; returns {id: (kanji forms, kana forms, common)} for JLPT matching."""
+def write_entries(db: sqlite3.Connection, jmdict: dict) -> dict[int, tuple[list[str], list[str], bool, set[str]]]:
+    """Inserts JMdict entries; returns {id: (kanji forms, kana forms, common, gloss words)} for JLPT matching."""
     frequencies = wordfreq.get_frequency_dict("ja", "best")
     forms_by_id = {}
     for word in jmdict["words"]:
@@ -189,8 +189,17 @@ def write_entries(db: sqlite3.Connection, jmdict: dict) -> dict[int, tuple[list[
                     as_json([g["text"] for g in s["gloss"] if g["lang"] == "eng"]) or "[]",
                 ),
             )
-        forms_by_id[entry_id] = (kanji, kana, common)
+        glosses = " ".join(g["text"] for s in word["sense"] for g in s["gloss"] if g["lang"] == "eng")
+        forms_by_id[entry_id] = (kanji, kana, common, meaning_words(glosses))
     return forms_by_id
+
+
+# Words too common in English glosses to tell entries apart.
+STOPWORDS = {"to", "the", "a", "an", "of", "be", "in", "on", "for", "or", "and", "one", "s", "e", "g", "etc", "with", "at", "as", "by", "is", "it"}
+
+
+def meaning_words(text: str) -> set[str]:
+    return set(re.findall(r"[a-z]+", text.lower())) - STOPWORDS
 
 
 def to_hiragana(text: str) -> str:
@@ -199,10 +208,12 @@ def to_hiragana(text: str) -> str:
 
 def write_jlpt(db: sqlite3.Connection, forms_by_id: dict) -> dict:
     """Sets entry.jlpt from the JLPT lists. Each listed spelling goes to the best matching JMdict entry:
-    that form with one of the listed readings, common entries first, then the lowest sequence number.
-    A word in several lists keeps the easiest level."""
+    that form with one of the listed readings, then the entry whose English glosses share the most words
+    with the list's meaning (いる "to be, to exist" is 居る, not 要る "to need"; いくら "how much" is 幾ら,
+    not "salmon roe"), then common entries, then the lowest sequence number. A word in several lists
+    keeps the easiest level."""
     by_form: dict[str, list[int]] = {}
-    for entry_id, (kanji, kana, _) in forms_by_id.items():
+    for entry_id, (kanji, kana, _, _) in forms_by_id.items():
         for form in set(kanji + kana):
             by_form.setdefault(form, []).append(entry_id)
 
@@ -233,10 +244,11 @@ def write_jlpt(db: sqlite3.Connection, forms_by_id: dict) -> dict:
                 continue
             stats["matched"] += 1
             # One entry per listed spelling (足; 脚 are separate JMdict entries), common entries first.
+            meaning = meaning_words(row["meaning"])
             for expression in alternatives(row["expression"]):
                 ids = candidates(expression, readings)
                 if ids:
-                    best = min(ids, key=lambda i: (not forms_by_id[i][2], i))
+                    best = min(ids, key=lambda i: (-len(meaning & forms_by_id[i][3]), not forms_by_id[i][2], i))
                     levels[best] = max(levels.get(best, 0), level)
     db.executemany("UPDATE entry SET jlpt = ? WHERE id = ?", [(level, i) for i, level in levels.items()])
     stats["entries"] = len(levels)
