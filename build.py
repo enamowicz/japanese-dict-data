@@ -1,9 +1,10 @@
 """Builds dict.sqlite for the Japanese reading app from public dictionary data.
 
 Sources (see DATA-LICENSE.md for licences):
-  JMdict (English) and KANJIDIC2 via jmdict-simplified, JLPT vocabulary lists from
-  open-anki-jlpt-decks, word frequencies from wordfreq. The release also carries the
-  SudachiDict system dictionary for the app's tokenizer, unchanged.
+  JMdict (English), KANJIDIC2 and KRADFILE via jmdict-simplified, JLPT vocabulary lists from
+  open-anki-jlpt-decks, kanji JLPT levels from kanji-data, stroke order from KanjiVG, word
+  frequencies from wordfreq. The release also carries the SudachiDict system dictionary for the
+  app's tokenizer, unchanged.
 
 Usage:
   python build.py [--out dist]
@@ -40,6 +41,9 @@ SUDACHI_RELEASE = "https://api.github.com/repos/WorksApplications/SudachiDict/re
 # "core" keeps compound words whole (人間関係, 一生懸命); "small" only has short units.
 SUDACHI_EDITION = "core"
 JLPT_CSV = "https://raw.githubusercontent.com/jamsinclair/open-anki-jlpt-decks/main/src/n{level}.csv"
+# Kanji N-levels (field jlpt_new, from the same Waller lists). Its WaniKani fields are not used.
+KANJI_DATA = "https://raw.githubusercontent.com/davidluzgouveia/kanji-data/master/kanji.json"
+KANJIVG_RELEASE = "https://api.github.com/repos/KanjiVG/kanjivg/releases/latest"
 CACHE = Path(__file__).parent / "cache"
 
 
@@ -55,8 +59,8 @@ def fetch(url: str, name: str) -> bytes:
     return path.read_bytes()
 
 
-def jmdict_simplified() -> tuple[str, dict, dict]:
-    """Returns (release tag, JMdict JSON, KANJIDIC2 JSON) from the latest jmdict-simplified release."""
+def jmdict_simplified() -> tuple[str, dict, dict, dict]:
+    """Returns (release tag, JMdict, KANJIDIC2, KRADFILE JSON) from the latest jmdict-simplified release."""
     release = json.loads(urllib.request.urlopen(JMDICT_RELEASE).read())
     assets = {a["name"]: a["browser_download_url"] for a in release["assets"]}
 
@@ -65,7 +69,7 @@ def jmdict_simplified() -> tuple[str, dict, dict]:
         with zipfile.ZipFile(io.BytesIO(fetch(assets[name], name))) as archive:
             return json.loads(archive.read(archive.namelist()[0]))
 
-    return release["tag_name"], load("jmdict-eng-3"), load("kanjidic2-en-3")
+    return release["tag_name"], load("jmdict-eng-3"), load("kanjidic2-en-3"), load("kradfile-3")
 
 
 SCHEMA_SQL = """
@@ -119,7 +123,8 @@ CREATE TABLE sense (
 ) WITHOUT ROWID;
 
 -- KANJIDIC2 characters. Readings and meanings are JSON arrays. jlpt_old is KANJIDIC2's pre-2010
--- four-level JLPT (4 easiest). SKIP codes are left out (separate licence).
+-- four-level JLPT (4 easiest); jlpt is the N-level, 5 (N5) to 1 (N1), from kanji-data. parts: JSON
+-- array of the components from KRADFILE (読: 言 士 儿 冖). SKIP codes are left out (separate licence).
 CREATE TABLE kanji (
   literal TEXT PRIMARY KEY,
   strokes INTEGER,
@@ -129,7 +134,26 @@ CREATE TABLE kanji (
   onyomi TEXT,
   kunyomi TEXT,
   nanori TEXT,
-  meanings TEXT
+  meanings TEXT,
+  jlpt INTEGER,
+  parts TEXT
+) WITHOUT ROWID;
+
+-- KanjiVG stroke order (kanji and kana). strokes: JSON array in stroke order of {"d": SVG path in a
+-- 109 x 109 box, "length": its length, "label": [x, y] of the stroke number, or null}. A rowid
+-- table, since rows are large (about 1.5 KB) and WITHOUT ROWID tables store large rows poorly.
+CREATE TABLE kanji_strokes (
+  literal TEXT PRIMARY KEY,
+  strokes TEXT NOT NULL
+);
+
+-- Words written with each kanji in their main spelling, best first: common, easier JLPT level, more
+-- frequent, shorter. Up to 12 per kanji.
+CREATE TABLE kanji_word (
+  literal TEXT NOT NULL,
+  ord INTEGER NOT NULL,
+  entry_id INTEGER NOT NULL,
+  PRIMARY KEY (literal, ord)
 ) WITHOUT ROWID;
 """
 
@@ -255,13 +279,14 @@ def write_jlpt(db: sqlite3.Connection, forms_by_id: dict) -> dict:
     return stats
 
 
-def write_kanji(db: sqlite3.Connection, kanjidic: dict) -> None:
+def write_kanji(db: sqlite3.Connection, kanjidic: dict, kradfile: dict) -> None:
+    levels = {literal: k["jlpt_new"] for literal, k in json.loads(fetch(KANJI_DATA, "kanji-data.json")).items()}
     for c in kanjidic["characters"]:
         misc = c["misc"]
         readings = [r for group in (c["readingMeaning"] or {}).get("groups", []) for r in group["readings"]]
         meanings = [m["value"] for group in (c["readingMeaning"] or {}).get("groups", []) for m in group["meanings"] if m["lang"] == "en"]
         db.execute(
-            "INSERT INTO kanji VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO kanji VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 c["literal"],
                 misc["strokeCounts"][0] if misc["strokeCounts"] else None,
@@ -272,8 +297,103 @@ def write_kanji(db: sqlite3.Connection, kanjidic: dict) -> None:
                 as_json([r["value"] for r in readings if r["type"] == "ja_kun"]),
                 as_json((c["readingMeaning"] or {}).get("nanori", [])),
                 as_json(meanings),
+                levels.get(c["literal"]),
+                as_json(kradfile["kanji"].get(c["literal"], [])),
             ),
         )
+
+
+def write_kanji_words(db: sqlite3.Connection, limit: int = 12) -> None:
+    """Fills kanji_word: for each kanji, the best words whose main spelling contains it."""
+    literals = {row[0] for row in db.execute("SELECT literal FROM kanji")}
+    words: dict[str, list[tuple]] = {}
+    rows = db.execute("SELECT f.entry_id, f.text, e.common, e.jlpt, e.zipf FROM kanji_form f JOIN entry e ON e.id = f.entry_id WHERE f.ord = 0")
+    for entry_id, text, common, jlpt, zipf in rows:
+        for char in set(text) & literals:
+            words.setdefault(char, []).append((-common, -(jlpt or 0), -zipf, len(text), entry_id))
+    db.executemany(
+        "INSERT INTO kanji_word VALUES (?, ?, ?)",
+        [(char, i, key[-1]) for char, keys in words.items() for i, key in enumerate(sorted(keys)[:limit])],
+    )
+
+
+# SVG path data: a command letter or a number ("1.2.3" is 1.2 and .3, "-1-2" is -1 and -2).
+PATH_TOKEN = re.compile(r"[MmCcSsLlZz]|[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?")
+
+
+def cubic_length(p0, p1, p2, p3, steps: int = 16) -> float:
+    length, previous = 0.0, p0
+    for i in range(1, steps + 1):
+        t = i / steps
+        a, b, c, d = (1 - t) ** 3, 3 * (1 - t) ** 2 * t, 3 * (1 - t) * t**2, t**3
+        point = (a * p0[0] + b * p1[0] + c * p2[0] + d * p3[0], a * p0[1] + b * p1[1] + c * p2[1] + d * p3[1])
+        length += math.dist(previous, point)
+        previous = point
+    return length
+
+
+def path_length(d: str) -> float:
+    """Length of an SVG path made of moves, lines and cubic curves (all that KanjiVG uses)."""
+    tokens = PATH_TOKEN.findall(d)
+    i = 0
+
+    def number() -> float:
+        nonlocal i
+        i += 1
+        return float(tokens[i - 1])
+
+    length, point, start, control, command = 0.0, (0.0, 0.0), (0.0, 0.0), None, ""
+    while i < len(tokens):
+        if tokens[i].isalpha():
+            command = tokens[i]
+            i += 1
+        kind, origin = command.upper(), point if command.islower() else (0.0, 0.0)
+        if kind == "Z":
+            length += math.dist(point, start)
+            point, control = start, None
+        elif kind == "M":
+            point = start = (origin[0] + number(), origin[1] + number())
+            command, control = ("l" if command.islower() else "L"), None
+        elif kind == "L":
+            end = (origin[0] + number(), origin[1] + number())
+            length += math.dist(point, end)
+            point, control = end, None
+        elif kind in "CS":
+            if kind == "C":
+                first = (origin[0] + number(), origin[1] + number())
+            else:  # S: the first control point mirrors the previous curve's second one
+                first = (2 * point[0] - control[0], 2 * point[1] - control[1]) if control else point
+            second = (origin[0] + number(), origin[1] + number())
+            end = (origin[0] + number(), origin[1] + number())
+            length += cubic_length(point, first, second, end)
+            point, control = end, second
+        else:
+            raise ValueError(f"unsupported path command {command} in {d}")
+    return length
+
+
+STROKE_PATH = re.compile(r'<path id="kvg:[0-9a-f]+-s(\d+)"[^>]*\sd="([^"]+)"')
+STROKE_LABEL = re.compile(r'<text transform="matrix\(1 0 0 1 ([\d.]+) ([\d.]+)\)">(\d+)</text>')
+
+
+def write_strokes(db: sqlite3.Connection) -> str:
+    """Fills kanji_strokes from the latest KanjiVG release ("main": one standard form per character).
+    Returns the release tag."""
+    release = json.loads(urllib.request.urlopen(KANJIVG_RELEASE).read())
+    asset = next(a for a in release["assets"] if a["name"].endswith("-main.zip"))
+    rows = []
+    with zipfile.ZipFile(io.BytesIO(fetch(asset["browser_download_url"], asset["name"]))) as archive:
+        for member in archive.namelist():
+            stem = Path(member).stem
+            if not member.endswith(".svg") or "-" in stem:
+                continue
+            svg = archive.read(member).decode("utf-8")
+            paths = sorted((int(n), d) for n, d in STROKE_PATH.findall(svg))
+            labels = {int(n): [float(x), float(y)] for x, y, n in STROKE_LABEL.findall(svg)}
+            strokes = [{"d": d, "length": round(path_length(d), 1), "label": labels.get(n)} for n, d in paths]
+            rows.append((chr(int(stem, 16)), json.dumps(strokes, ensure_ascii=False, separators=(",", ":"))))
+    db.executemany("INSERT INTO kanji_strokes VALUES (?, ?)", rows)
+    return release["tag_name"]
 
 
 def sudachi_dictionary(out: Path) -> dict:
@@ -321,7 +441,7 @@ def main() -> None:
     args = parser.parse_args()
     args.out.mkdir(exist_ok=True)
 
-    tag, jmdict, kanjidic = jmdict_simplified()
+    tag, jmdict, kanjidic, kradfile = jmdict_simplified()
     # UTC build time, so a second build on the same day is still a new version.
     version = datetime.datetime.now(datetime.timezone.utc).strftime("%Y.%m.%d-%H%M")
     db_path = args.out / "dict.sqlite"
@@ -332,7 +452,9 @@ def main() -> None:
 
     forms_by_id = write_entries(db, jmdict)
     jlpt = write_jlpt(db, forms_by_id)
-    write_kanji(db, kanjidic)
+    write_kanji(db, kanjidic, kradfile)
+    write_kanji_words(db)
+    kanjivg = write_strokes(db)
     db.executescript(INDEX_SQL)
 
     meta = {
@@ -341,6 +463,8 @@ def main() -> None:
         "jmdict_simplified": tag,
         "jmdict_date": jmdict["dictDate"],
         "kanjidic2_date": kanjidic["dictDate"],
+        "kradfile": kradfile["version"],
+        "kanjivg": kanjivg,
         "wordfreq": importlib.metadata.version("wordfreq"),
     }
     db.executemany("INSERT INTO meta VALUES (?, ?)", meta.items())

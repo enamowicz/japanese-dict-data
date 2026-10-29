@@ -20,7 +20,10 @@ The app reads `https://github.com/enamowicz/japanese-dict-data/releases/latest/d
   plus `common`, `jlpt` (5 = N5 … 1 = N1) and `zipf` (wordfreq frequency × 100).
 - `kanji_form`, `kana_form`: written forms and readings, indexed by `text` for lookups.
 - `sense`: meanings, with parts of speech and English glosses as JSON arrays.
-- `kanji`: KANJIDIC2 characters (strokes, grade, frequency, readings, meanings).
+- `kanji`: KANJIDIC2 characters (strokes, grade, frequency, readings, meanings), with the JLPT N-level
+  (kanji-data) and components (KRADFILE).
+- `kanji_strokes`: KanjiVG stroke order: SVG paths in drawing order, with lengths and stroke-number positions.
+- `kanji_word`: up to 12 common words written with each kanji.
 - `meta`: version and source dates.
 
 See `build.py` for the exact layout.
